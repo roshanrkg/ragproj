@@ -10,6 +10,20 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
+
+try:
+    from mistralai.client import Mistral
+except ImportError:
+    from mistralai import Mistral
+
+try:
+    import pypdfium2
+    import numpy as np
+    from rapidocr_onnxruntime import RapidOCR
+    RAPIDOCR_AVAILABLE = True
+except ImportError:
+    RAPIDOCR_AVAILABLE = False
 
 load_dotenv()
 
@@ -108,30 +122,146 @@ Do not invent facts. When useful, mention the page number of the supporting info
 )
 
 
-def index_pdf(uploaded_file):
-    """Load, split, and index an uploaded PDF into the persistent Chroma store."""
-    file_bytes = uploaded_file.getvalue()
-    file_hash = hashlib.sha256(file_bytes).hexdigest()
+def extract_with_mistral_ocr(file_bytes: bytes, filename: str) -> list[Document]:
+    """Extract document markdown using Mistral OCR API (mistral-ocr-latest)."""
+    api_key = os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        raise ValueError("MISTRAL_API_KEY is missing from environment.")
 
-    if file_hash in st.session_state.indexed_files:
-        return 0, "This PDF has already been indexed in this session."
+    client = Mistral(api_key=api_key)
+    uploaded_file = None
+    try:
+        uploaded_file = client.files.upload(
+            file={"file_name": filename, "content": file_bytes},
+            purpose="ocr",
+        )
+        signed_url = client.files.get_signed_url(file_id=uploaded_file.id)
+        ocr_response = client.ocr.process(
+            model="mistral-ocr-latest",
+            document={"type": "document_url", "document_url": signed_url.url},
+        )
+        docs = []
+        for page in ocr_response.pages:
+            content = (page.markdown or "").strip()
+            if content:
+                docs.append(
+                    Document(
+                        page_content=content,
+                        metadata={
+                            "source": filename,
+                            "page": page.index,
+                            "extraction": "Mistral OCR",
+                        },
+                    )
+                )
+        return docs
+    finally:
+        if uploaded_file and hasattr(uploaded_file, "id"):
+            try:
+                client.files.delete(file_id=uploaded_file.id)
+            except Exception:
+                pass
 
-    # PyPDFLoader works with a file path, so write the upload to a temporary file.
+
+def extract_with_local_ocr(file_bytes: bytes, filename: str) -> list[Document]:
+    """Extract scanned pages locally using pypdfium2 and RapidOCR (offline, zero API cost)."""
+    if not RAPIDOCR_AVAILABLE:
+        raise RuntimeError("Local OCR engine (rapidocr-onnxruntime / pypdfium2) is not installed.")
+
+    ocr_engine = RapidOCR()
+    pdf = pypdfium2.PdfDocument(file_bytes)
+    docs = []
+
+    for page_idx in range(len(pdf)):
+        page = pdf.get_page(page_idx)
+        # Render at 2x scale for sharper character recognition
+        pil_image = page.render(scale=2).to_pil()
+        ocr_result, _ = ocr_engine(np.array(pil_image))
+        if ocr_result:
+            text_lines = [line[1] for line in ocr_result if len(line) > 1 and line[1].strip()]
+            page_text = "\n".join(text_lines).strip()
+            if page_text:
+                docs.append(
+                    Document(
+                        page_content=page_text,
+                        metadata={
+                            "source": filename,
+                            "page": page_idx,
+                            "extraction": "Local RapidOCR",
+                        },
+                    )
+                )
+    return docs
+
+
+def load_and_extract_pdf(file_bytes: bytes, filename: str, ocr_mode: str) -> tuple[list[Document], str]:
+    """
+    Extract text/markdown from a PDF.
+    - If digital text is present and 'Always Mistral OCR' is not chosen, extracts digitally.
+    - If scanned/image-only, runs Mistral OCR (Option 1) with automatic local OCR fallback if rate limited.
+    """
+    documents = []
+    extraction_label = "Digital"
+
+    # If user selected 'Always Mistral OCR', skip digital extraction
+    if ocr_mode == "Always Mistral OCR":
+        docs = extract_with_mistral_ocr(file_bytes, filename)
+        return docs, "Mistral OCR API"
+
+    # Otherwise, attempt fast digital extraction first
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
         temp_file.write(file_bytes)
         temp_path = temp_file.name
 
     try:
         documents = PyPDFLoader(temp_path).load()
+    except Exception:
+        documents = []
     finally:
         Path(temp_path).unlink(missing_ok=True)
 
-    if not documents:
-        raise ValueError("No readable pages were found in this PDF.")
+    total_chars = sum(len(d.page_content.strip()) for d in documents) if documents else 0
+    is_scanned = total_chars < 50
 
-    # Preserve the uploaded filename in metadata and retain PDF page numbers.
-    for document in documents:
-        document.metadata["source"] = uploaded_file.name
+    if not is_scanned:
+        for doc in documents:
+            doc.metadata["source"] = filename
+            doc.metadata["extraction"] = "Digital text"
+        return documents, "Digital text"
+
+    # Scanned PDF detected: run OCR
+    if ocr_mode == "Local RapidOCR (Offline)":
+        docs = extract_with_local_ocr(file_bytes, filename)
+        return docs, "Local RapidOCR"
+
+    # Default / Preferred: Mistral OCR (Cloud)
+    try:
+        docs = extract_with_mistral_ocr(file_bytes, filename)
+        extraction_label = "Mistral OCR API"
+    except Exception as exc:
+        # If Mistral OCR is rate limited (e.g. 429 on free tier) or errors, gracefully fall back to local OCR
+        if RAPIDOCR_AVAILABLE:
+            st.warning(f"Mistral OCR encountered an issue: {exc}. Falling back to Local RapidOCR engine.")
+            docs = extract_with_local_ocr(file_bytes, filename)
+            extraction_label = "Local RapidOCR (Fallback)"
+        else:
+            raise exc
+
+    if not docs:
+        raise ValueError("No text could be extracted from this PDF using digital extraction or OCR.")
+
+    return docs, extraction_label
+
+
+def index_pdf(uploaded_file, ocr_mode: str):
+    """Load, OCR if scanned, split, and index an uploaded PDF into the Chroma store."""
+    file_bytes = uploaded_file.getvalue()
+    file_hash = hashlib.sha256(file_bytes + ocr_mode.encode()).hexdigest()
+
+    if file_hash in st.session_state.indexed_files:
+        return 0, "This PDF has already been indexed in this session."
+
+    documents, method = load_and_extract_pdf(file_bytes, uploaded_file.name, ocr_mode=ocr_mode)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -141,11 +271,11 @@ def index_pdf(uploaded_file):
     chunks = splitter.split_documents(documents)
 
     if not chunks:
-        raise ValueError("No text could be extracted. The PDF may be scanned or image-only.")
+        raise ValueError("No text chunks could be created from this PDF.")
 
     get_vectorstore().add_documents(chunks)
     st.session_state.indexed_files.add(file_hash)
-    return len(chunks), None
+    return len(chunks), f"Extracted via {method}"
 
 
 def answer_question(question):
@@ -158,7 +288,9 @@ def answer_question(question):
         page = doc.metadata.get("page")
         page_label = f"Page {page + 1}" if isinstance(page, int) else "Page unknown"
         source = doc.metadata.get("source", "Uploaded document")
-        context_parts.append(f"[Source: {source}, {page_label}]\n{doc.page_content}")
+        method = doc.metadata.get("extraction", "")
+        method_badge = f" [{method}]" if method else ""
+        context_parts.append(f"[Source: {source}, {page_label}{method_badge}]\n{doc.page_content}")
 
     context = "\n\n---\n\n".join(context_parts)
     final_prompt = PROMPT.invoke({"context": context, "question": question})
@@ -185,7 +317,22 @@ with st.sidebar:
         "Upload one or more PDF documents",
         type=["pdf"],
         accept_multiple_files=True,
-        help="Text-based PDFs work best. Scanned PDFs need OCR before their text can be searched.",
+        help="Supports both digital and scanned / image-based PDFs.",
+    )
+
+    ocr_mode = st.selectbox(
+        "OCR Strategy",
+        options=[
+            "Auto (Mistral OCR for scanned)",
+            "Always Mistral OCR",
+            "Local RapidOCR (Offline)",
+        ],
+        index=0,
+        help=(
+            "• Auto: Digital extraction for searchable PDFs, Mistral OCR for scanned.\n"
+            "• Always Mistral OCR: High-fidelity markdown & table parsing for all pages.\n"
+            "• Local RapidOCR: Fast, offline OCR with no API limits."
+        ),
     )
 
     if st.button("Process PDFs", type="primary", use_container_width=True):
@@ -199,11 +346,11 @@ with st.sidebar:
             success_count = 0
             for index, pdf in enumerate(uploaded_files):
                 try:
-                    chunk_count, message = index_pdf(pdf)
-                    if message:
-                        st.info(f"**{pdf.name}:** {message}")
+                    chunk_count, method_info = index_pdf(pdf, ocr_mode=ocr_mode)
+                    if chunk_count == 0:
+                        st.info(f"**{pdf.name}:** {method_info}")
                     else:
-                        st.success(f"**{pdf.name}** indexed into {chunk_count} chunks.")
+                        st.success(f"**{pdf.name}** indexed into {chunk_count} chunks ({method_info}).")
                         success_count += 1
                         if pdf.name not in st.session_state.uploaded_names:
                             st.session_state.uploaded_names.append(pdf.name)
@@ -232,6 +379,7 @@ with st.sidebar:
     st.markdown(
         "- **Chat model:** Mistral\n"
         "- **Embeddings:** Mistral\n"
+        "- **OCR:** Mistral OCR (`mistral-ocr-latest`)\n"
         "- **Vector store:** ChromaDB\n"
         "- **Retrieval:** MMR (4 chunks)"
     )
@@ -245,18 +393,20 @@ st.markdown(
     <div class="hero">
       <span class="pill">RETRIEVAL-AUGMENTED GENERATION</span>
       <h1>Ask your documents.</h1>
-      <p>Upload PDFs, retrieve relevant passages, and get answers grounded in your own knowledge base.</p>
+      <p>Upload digital or scanned PDFs, retrieve relevant passages, and get answers grounded in your own knowledge base.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-metric_col1, metric_col2, metric_col3 = st.columns(3)
+metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
 with metric_col1:
-    st.metric("Documents this session", len(st.session_state.uploaded_names))
+    st.metric("Documents indexed", len(st.session_state.uploaded_names))
 with metric_col2:
     st.metric("Retrieval strategy", "MMR")
 with metric_col3:
+    st.metric("OCR Engine", "Mistral OCR")
+with metric_col4:
     st.metric("Answer model", "Mistral AI")
 
 if not os.getenv("MISTRAL_API_KEY"):
@@ -285,7 +435,9 @@ if question:
                             for doc in source_docs:
                                 page = doc.metadata.get("page")
                                 page_label = f"Page {page + 1}" if isinstance(page, int) else "Page unknown"
-                                st.markdown(f"**{doc.metadata.get('source', 'Uploaded document')} · {page_label}**")
+                                method = doc.metadata.get("extraction", "")
+                                method_tag = f" · {method}" if method else ""
+                                st.markdown(f"**{doc.metadata.get('source', 'Uploaded document')} · {page_label}{method_tag}**")
                                 excerpt = doc.page_content.strip()
                                 st.caption(excerpt[:700] + ("…" if len(excerpt) > 700 else ""))
                 except Exception as exc:

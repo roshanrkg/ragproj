@@ -17,8 +17,10 @@ chromadb
 # Embedding Models
 sentence-transformers
 
-# Document Loaders
+# Document Loaders & OCR
 pypdf
+pypdfium2
+rapidocr-onnxruntime
 unstructured
 beautifulsoup4
 lxml
