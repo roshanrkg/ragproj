@@ -1,0 +1,17 @@
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+
+# Keep an example environment file if needed
+!.env.example
+
+# Editor and OS files
+.vscode/
+.DS_Store
