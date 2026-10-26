@@ -22,8 +22,10 @@ try:
     import numpy as np
     from rapidocr_onnxruntime import RapidOCR
     RAPIDOCR_AVAILABLE = True
-except ImportError:
+    RAPIDOCR_ERROR = None
+except Exception as e:
     RAPIDOCR_AVAILABLE = False
+    RAPIDOCR_ERROR = str(e)
 
 load_dotenv()
 
@@ -245,7 +247,9 @@ def load_and_extract_pdf(file_bytes: bytes, filename: str, ocr_mode: str) -> tup
             docs = extract_with_local_ocr(file_bytes, filename)
             extraction_label = "Local RapidOCR (Fallback)"
         else:
-            raise exc
+            raise RuntimeError(
+                f"Mistral OCR failed ({exc}), and Local RapidOCR fallback is unavailable: {RAPIDOCR_ERROR}"
+            ) from exc
 
     if not docs:
         raise ValueError("No text could be extracted from this PDF using digital extraction or OCR.")
@@ -334,6 +338,9 @@ with st.sidebar:
             "• Local RapidOCR: Fast, offline OCR with no API limits."
         ),
     )
+
+    if not RAPIDOCR_AVAILABLE:
+        st.caption(f"⚠️ Offline OCR engine unavailable: {RAPIDOCR_ERROR}")
 
     if st.button("Process PDFs", type="primary", use_container_width=True):
         if not uploaded_files:

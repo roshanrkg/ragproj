@@ -20,6 +20,7 @@ sentence-transformers
 # Document Loaders & OCR
 pypdf
 pypdfium2
+opencv-python-headless
 rapidocr-onnxruntime
 unstructured
 beautifulsoup4
