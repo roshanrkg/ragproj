@@ -9,7 +9,8 @@ from langchain_mistralai import MistralAIEmbeddings, ChatMistralAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_core.documents import Document
 
 try:
@@ -106,20 +107,36 @@ def get_retriever():
     )
 
 
-PROMPT = ChatPromptTemplate.from_messages(
+CONTEXTUALIZE_Q_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """Given a chat history and the latest user question which might reference context in the chat history, 
+formulate a standalone question which can be understood without the chat history. 
+Do NOT answer the question. 
+Do NOT add any explanation, commentary, preamble, or conversational remarks.
+Only output the reformulated question, or return the original question as-is if no reformulation is needed.""",
+        ),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}"),
+    ]
+)
+
+QA_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
             """You are a helpful AI assistant.
-Use only the provided context to answer the question.
+Use only the following provided context to answer the question.
 If the answer is not present in the context, say:
 "I could not find the answer in the context provided."
-Do not invent facts. When useful, mention the page number of the supporting information.""",
+Do not invent facts. When useful, mention the page number of the supporting information.
+
+Context:
+{context}""",
         ),
-        (
-            "human",
-            "Context:\n{context}\n\nQuestion:\n{question}",
-        ),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}"),
     ]
 )
 
@@ -282,11 +299,48 @@ def index_pdf(uploaded_file, ocr_mode: str):
     return len(chunks), f"Extracted via {method}"
 
 
-def answer_question(question):
-    docs = get_retriever().invoke(question)
-    if not docs:
-        return "I could not find the answer in the context provided.", []
+def get_chat_history(max_messages: int = 6) -> list[BaseMessage]:
+    """Extract recent chat messages from session state into LangChain message objects."""
+    history: list[BaseMessage] = []
+    eligible = [
+        m for m in st.session_state.get("messages", [])
+        if not m.get("content", "").startswith("Ready! I indexed")
+    ]
+    for msg in eligible[-max_messages:]:
+        if msg["role"] == "user":
+            history.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            history.append(AIMessage(content=msg["content"]))
+    return history
 
+
+def contextualize_question(question: str, chat_history: list[BaseMessage]) -> str:
+    """Rewrite a follow-up question into a standalone query using prior chat context."""
+    if not chat_history:
+        return question
+
+    try:
+        prompt_val = CONTEXTUALIZE_Q_PROMPT.invoke({
+            "chat_history": chat_history,
+            "question": question,
+        })
+        response = get_llm().invoke(prompt_val)
+        rewritten = response.content.strip()
+        return rewritten if rewritten else question
+    except Exception:
+        return question
+
+
+def answer_question(question: str, chat_history: list[BaseMessage]):
+    # 1. Rewrite follow-up question into standalone search query
+    search_query = contextualize_question(question, chat_history)
+
+    # 2. Retrieve relevant chunks using the rewritten query
+    docs = get_retriever().invoke(search_query)
+    if not docs:
+        return "I could not find the answer in the context provided.", [], search_query
+
+    # 3. Format context chunks
     context_parts = []
     for doc in docs:
         page = doc.metadata.get("page")
@@ -297,9 +351,15 @@ def answer_question(question):
         context_parts.append(f"[Source: {source}, {page_label}{method_badge}]\n{doc.page_content}")
 
     context = "\n\n---\n\n".join(context_parts)
-    final_prompt = PROMPT.invoke({"context": context, "question": question})
+
+    # 4. Generate grounded answer with context and conversational history
+    final_prompt = QA_PROMPT.invoke({
+        "context": context,
+        "chat_history": chat_history,
+        "question": question,
+    })
     response = get_llm().invoke(final_prompt)
-    return response.content, docs
+    return response.content, docs, search_query
 
 
 # ----------------------------- Session state -----------------------------
@@ -428,6 +488,9 @@ if question:
     if not os.getenv("MISTRAL_API_KEY"):
         st.error("MISTRAL_API_KEY is missing. Add it to your `.env` file and restart the app.")
     else:
+        # Capture recent chat history before adding the new question
+        chat_history = get_chat_history(max_messages=6)
+
         st.session_state.messages.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
@@ -435,10 +498,12 @@ if question:
         with st.chat_message("assistant"):
             with st.spinner("Searching your documents and composing an answer…"):
                 try:
-                    answer, source_docs = answer_question(question)
+                    answer, source_docs, search_query = answer_question(question, chat_history)
                     st.markdown(answer)
                     if source_docs:
                         with st.expander("Sources used"):
+                            if search_query and search_query.strip().lower() != question.strip().lower():
+                                st.caption(f"🔎 **Understood search query:** *{search_query}*")
                             for doc in source_docs:
                                 page = doc.metadata.get("page")
                                 page_label = f"Page {page + 1}" if isinstance(page, int) else "Page unknown"
